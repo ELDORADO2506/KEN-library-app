@@ -305,7 +305,45 @@ elif page == "Locations":
             st.success("Location added.")
 
 # ---------- Import / Export ----------
-elif page == "Import / Export":
+elif page == "Import / Export":# ---- Merge import (no duplicates; updates existing titles) ----
+import sqlite3
+
+def ensure_unique_title_index():
+    conn = sqlite3.connect("library.db")
+    with conn:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_books_title ON books(title COLLATE NOCASE);")
+    conn.close()
+
+def upsert_book_row(conn, title, author, genre, defloc):
+    conn.execute("""
+        INSERT INTO books(title, author, genre, default_location)
+        VALUES(?,?,?,?)
+        ON CONFLICT(title) DO UPDATE SET
+          author=excluded.author,
+          genre=excluded.genre,
+          default_location=excluded.default_location;
+    """, (title, author or "", genre or "", defloc or ""))
+
+st.subheader("Merge import (no duplicates)")
+merge_up = st.file_uploader("Upload Books CSV (Title, Author, Genre, Default_Location)", type=["csv"], key="merge_books")
+if merge_up is not None:
+    import pandas as pd
+    df = pd.read_csv(merge_up)
+    st.write("Uploaded rows:", len(df))
+    st.write("Columns:", list(df.columns))
+    ensure_unique_title_index()
+    conn = sqlite3.connect("library.db")
+    changed = 0
+    with conn:
+        for _, r in df.iterrows():
+            t = str(r.get("Title","")).strip()
+            if not t:
+                continue
+            upsert_book_row(conn, t, r.get("Author",""), r.get("Genre",""), r.get("Default_Location",""))
+            changed += 1
+    conn.close()
+    st.success(f"Merged {changed} rows. Existing titles updated; new titles added.")
+    st.rerun()
     st.subheader("Import Books (CSV)")
     up = st.file_uploader("Upload CSV with columns: Title, Author, Genre, Default_Location (optional)", type=["csv"])
     if up is not None:
