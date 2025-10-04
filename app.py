@@ -1,381 +1,398 @@
-
+# --- app.py starts here ---
 import streamlit as st
 import sqlite3
 import pandas as pd
-from io import BytesIO
-import qrcode
-from PIL import Image
-from datetime import date, timedelta
+from datetime import datetime, date
 
 DB_PATH = "library.db"
 
-# ---------- DB helpers ----------
+# ---------------- DB Helpers ----------------
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+    return sqlite3.connect(DB_PATH)
 
-def init_db():
-    with open("schema.sql", "r", encoding="utf-8") as f:
-        schema = f.read()
+def run_write(sql, params=()):
     conn = get_conn()
     with conn:
-        conn.executescript(schema)
+        conn.execute(sql, params)
     conn.close()
 
-def fetch_df(query, params=()):
+def run_write_many(sql, rows):
     conn = get_conn()
-    df = pd.read_sql_query(query, conn, params=params)
+    with conn:
+        conn.executemany(sql, rows)
+    conn.close()
+
+def fetch_df(sql, params=()):
+    conn = get_conn()
+    df = pd.read_sql_query(sql, conn, params=params)
     conn.close()
     return df
 
-def run_write(query, params=()):
+def init_db():
     conn = get_conn()
-    with conn:
-        conn.execute(query, params)
-    conn.close()
+    cur = conn.cursor()
 
-def run_write_return_id(query, params=()):
-    conn = get_conn()
-    with conn:
-        cur = conn.execute(query, params)
-        new_id = cur.lastrowid
-    conn.close()
-    return new_id
-
-# ---------- Derived helpers ----------
-def availability_of_copy(copy_id):
-    # If any open transaction exists (no return_date), copy is Issued
-    df = fetch_df("SELECT * FROM transactions WHERE copy_id=? AND (return_date IS NULL OR return_date='')", (copy_id,))
-    return "Issued" if len(df) > 0 else "Available"
-
-def issued_to(copy_id):
-    df = fetch_df("""
-        SELECT m.name FROM transactions t
-        JOIN members m ON m.id = t.member_id
-        WHERE t.copy_id=? AND (t.return_date IS NULL OR t.return_date='')
-        ORDER BY t.id DESC LIMIT 1
-    """, (copy_id,))
-    return df['name'].iloc[0] if len(df)>0 else ""
-
-def ensure_default_locations():
-    # Preload compartments 1..45 if empty
-    df = fetch_df("SELECT COUNT(*) AS c FROM locations")
-    if df['c'].iloc[0] == 0:
-        conn = get_conn()
-        with conn:
-            for i in range(1, 46):
-                conn.execute("INSERT INTO locations(location_id, description) VALUES(?,?)",
-                             (f"Compartment {i}", ""))
-        conn.close()
-
-# ---------- UI ----------
-st.set_page_config(page_title="KEN Library", layout="wide")
-st.title("📚 KEN Library System")
-
-# Sidebar nav
-page = st.sidebar.radio("Go to", [
-    "Dashboard",
-    "Search",
-    "Books",
-    "Copies",
-    "Members",
-    "Issue / Return",
-    "Locations",
-    "Import / Export",
-])
-
-# One-time DB init
-if 'db_inited' not in st.session_state:
-    init_db()
-    ensure_default_locations()
-    st.session_state['db_inited'] = True
-
-# ---------- Dashboard ----------
-if page == "Dashboard":
-    col1, col2, col3 = st.columns(3)
-    total_titles = fetch_df("SELECT COUNT(*) AS c FROM books")['c'].iloc[0]
-    total_copies = fetch_df("SELECT COUNT(*) AS c FROM copies")['c'].iloc[0]
-    issued_now = fetch_df("SELECT COUNT(*) AS c FROM transactions WHERE (return_date IS NULL OR return_date='')")['c'].iloc[0]
-
-    with col1:
-        st.metric("Total Titles", total_titles)
-    with col2:
-        st.metric("Total Copies", total_copies)
-    with col3:
-        st.metric("Issued Now (open)", issued_now)
-
-    # Titles by Genre
-    genre_df = fetch_df("SELECT genre AS Genre, COUNT(*) AS Titles FROM books GROUP BY genre ORDER BY Titles DESC")
-    st.subheader("Titles by Genre")
-    st.bar_chart(genre_df, x="Genre", y="Titles")
-
-    # Overdue list
-    st.subheader("Overdue")
-    overdue = fetch_df("""
-        SELECT t.id AS Issue_ID, c.accession_no, b.title, m.name AS member, t.issue_date, t.due_date
-        FROM transactions t
-        JOIN copies c ON c.id = t.copy_id
-        JOIN books b ON b.id = c.book_id
-        JOIN members m ON m.id = t.member_id
-        WHERE (t.return_date IS NULL OR t.return_date='') AND t.due_date IS NOT NULL AND DATE(t.due_date) < DATE('now')
-        ORDER BY t.due_date ASC
+    # Books
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS books(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT UNIQUE COLLATE NOCASE,
+        author TEXT,
+        genre TEXT,
+        default_location TEXT
+    );
     """)
-    st.dataframe(overdue)
 
-# ---------- Search ----------
-elif page == "Search":
-    q = st.text_input("Type part of a title to search")
-    if q:
-        res = fetch_df("""
-            SELECT b.title, b.author, b.genre, b.default_location, c.accession_no,
-                   COALESCE(NULLIF(?,''), '') as query
-            FROM books b
-            LEFT JOIN copies c ON c.book_id = b.id
-            WHERE LOWER(b.title) LIKE LOWER(?) OR LOWER(b.author) LIKE LOWER(?)
-            ORDER BY b.title
-        """, (q, f"%{q}%", f"%{q}%"))
+    # Copies (physical)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS copies(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        book_id INTEGER,
+        accession_no TEXT,
+        current_location TEXT,
+        status TEXT DEFAULT 'available',
+        FOREIGN KEY(book_id) REFERENCES books(id)
+    );
+    """)
+
+    # Members
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS members(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        email TEXT
+    );
+    """)
+
+    # Transactions (issue/return)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS transactions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        copy_id INTEGER,
+        member_id INTEGER,
+        issue_date TEXT,
+        due_date TEXT,
+        return_date TEXT,
+        FOREIGN KEY(copy_id) REFERENCES copies(id),
+        FOREIGN KEY(member_id) REFERENCES members(id)
+    );
+    """)
+
+    # Locations (compartments)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS locations(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        location_id TEXT UNIQUE COLLATE NOCASE,
+        description TEXT
+    );
+    """)
+
+    # Make a unique index on book title (safe upsert)
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_books_title ON books(title COLLATE NOCASE);")
+
+    conn.commit()
+    conn.close()
+
+def ensure_default_locations(n=45):
+    # Create Compartment 1..n if not present
+    existing = fetch_df("SELECT location_id FROM locations")
+    have = set(x.lower() for x in existing['location_id'].tolist()) if not existing.empty else set()
+    todo = []
+    for i in range(1, n+1):
+        lid = f"Compartment {i}"
+        if lid.lower() not in have:
+            todo.append((lid, f"Auto-created slot {i}"))
+    if todo:
+        run_write_many("INSERT OR IGNORE INTO locations(location_id, description) VALUES(?,?)", todo)
+
+# ------------- UI: Sidebar -------------
+def sidebar():
+    st.sidebar.title("Go to")
+    return st.sidebar.radio("", [
+        "Dashboard", "Search", "Books", "Copies", "Members",
+        "Issue / Return", "Locations", "Import / Export"
+    ])
+
+# ------------- Pages -------------
+def page_dashboard():
+    st.title("📚 KEN Library System")
+
+    totals = {
+        "titles": fetch_df("SELECT COUNT(*) c FROM books")["c"][0],
+        "copies": fetch_df("SELECT COUNT(*) c FROM copies")["c"][0],
+        "open_issues": fetch_df("SELECT COUNT(*) c FROM transactions WHERE return_date IS NULL")["c"][0],
+    }
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Titles", totals["titles"])
+    c2.metric("Total Copies", totals["copies"])
+    c3.metric("Issued Now (open)", totals["open_issues"])
+
+    by_genre = fetch_df("SELECT IFNULL(genre,'(none)') genre, COUNT(*) c FROM books GROUP BY IFNULL(genre,'(none)') ORDER BY c DESC")
+    st.subheader("Titles by Genre")
+    if not by_genre.empty:
+        st.bar_chart(by_genre.set_index("genre")["c"])
     else:
-        res = fetch_df("""
-            SELECT b.title, b.author, b.genre, b.default_location, c.accession_no
-            FROM books b LEFT JOIN copies c ON c.book_id = b.id
-            ORDER BY b.title
-            LIMIT 50
-        """)
-    st.dataframe(res)
+        st.info("No data yet. Import books to get started.")
 
-# ---------- Books ----------
-elif page == "Books":
+def page_search():
+    st.subheader("Search")
+    q = st.text_input("Search across title/author/genre")
+    if q:
+        qlike = f"%{q}%"
+        df = fetch_df("""
+            SELECT id, title, author, genre, default_location
+            FROM books
+            WHERE title LIKE ? OR author LIKE ? OR genre LIKE ?
+            ORDER BY title
+        """, (qlike, qlike, qlike))
+        st.dataframe(df, use_container_width=True)
+
+def page_books():
+    st.subheader("Books")
+    df = fetch_df("SELECT id, title, author, genre, default_location FROM books ORDER BY title")
+    st.dataframe(df, use_container_width=True)
+
+    st.write("---")
     st.subheader("Add a Book")
     with st.form("add_book"):
-        title = st.text_input("Title*", key="title")
-        author = st.text_input("Author", key="author")
-        genre = st.text_input("Genre", key="genre")
-        publisher = st.text_input("Publisher", key="publisher")
-        year = st.text_input("Year", key="year")
-        isbn = st.text_input("ISBN", key="isbn")
-        default_location = st.text_input("Default Location (e.g., Compartment 12)", key="defloc")
-        notes = st.text_area("Notes", key="notes")
-        submitted = st.form_submit_button("Add Book")
-        if submitted and title.strip():
-            run_write("""
-                INSERT OR IGNORE INTO books(title, author, genre, publisher, year, isbn, default_location, notes)
-                VALUES(?,?,?,?,?,?,?,?)
-            """, (title.strip(), author, genre, publisher, year, isbn, default_location, notes))
-            st.success("Book added.")
+        t = st.text_input("Title")
+        a = st.text_input("Author")
+        g = st.text_input("Genre")
+        loc = st.text_input("Default Location (e.g., Compartment 5)")
+        s = st.form_submit_button("Add")
+        if s and t.strip():
+            try:
+                run_write("INSERT INTO books(title, author, genre, default_location) VALUES(?,?,?,?)",
+                          (t.strip(), a.strip(), g.strip(), loc.strip()))
+                st.success("Book added.")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.error("A book with this title already exists.")
 
-    st.subheader("All Books")
-    books = fetch_df("SELECT id, title, author, genre, default_location FROM books ORDER BY title")
-    st.dataframe(books)
-
-# ---------- Copies ----------
-elif page == "Copies":
-    st.subheader("Add a Copy")
-    books = fetch_df("SELECT id, title FROM books ORDER BY title")
-    if len(books)==0:
-        st.info("Add a book first on the Books page.")
-    else:
-        with st.form("add_copy"):
-            book_title = st.selectbox("Book", options=books['title'].tolist())
-            accession_no = st.text_input("Accession No (e.g., KEN-00001)")
-            cond = st.selectbox("Condition", ["Good","Worn","Damaged"])
-            acquired_date = st.date_input("Acquired Date", value=date.today())
-            purchase_price = st.text_input("Purchase Price (optional)")
-            current_location = st.text_input("Current Location (e.g., Compartment 12)")
-            submit = st.form_submit_button("Add Copy")
-            if submit:
-                book_id = int(books.loc[books['title']==book_title, 'id'].iloc[0])
-                run_write("""
-                    INSERT OR IGNORE INTO copies(accession_no, book_id, condition, acquired_date, purchase_price, current_location)
-                    VALUES(?,?,?,?,?,?)
-                """, (accession_no.strip() if accession_no else None, book_id, cond, str(acquired_date), purchase_price or None, current_location or None))
-                st.success("Copy added.")
-
-    st.subheader("All Copies (with status)")
-    copies = fetch_df("""
-        SELECT c.id, c.accession_no, b.title, c.current_location
+def page_copies():
+    st.subheader("Copies")
+    df = fetch_df("""
+        SELECT c.id, b.title, c.accession_no, c.current_location, c.status
         FROM copies c JOIN books b ON b.id = c.book_id
         ORDER BY b.title
     """)
-    # compute availability quickly
-    if len(copies)>0:
-        copies['Availability'] = copies['id'].apply(lambda cid: availability_of_copy(int(cid)))
-        copies['Issued To'] = copies['id'].apply(lambda cid: issued_to(int(cid)))
-    st.dataframe(copies)
+    st.dataframe(df, use_container_width=True)
 
-    st.subheader("Download QR for a Copy")
-    copy_list = fetch_df("SELECT id, accession_no, (SELECT title FROM books WHERE books.id=copies.book_id) as title FROM copies")
-    if len(copy_list)>0:
-        opt = st.selectbox("Choose copy", options=copy_list['accession_no'].fillna("N/A").tolist())
-        if opt:
-            row = copy_list.loc[copy_list['accession_no']==opt].iloc[0]
-            qr_text = f"KEN|{row['accession_no']}|{row['title']}"
-            if st.button("Generate QR"):
-                img = qrcode.make(qr_text)
-                st.image(img, caption=qr_text)
-                buf = BytesIO()
-                img.save(buf, format="PNG")
-                st.download_button("Download QR PNG", data=buf.getvalue(), file_name=f"{row['accession_no']}.png", mime="image/png")
+    st.write("---")
+    st.subheader("Add a Copy")
+    books = fetch_df("SELECT id, title FROM books ORDER BY title")
+    book_map = {row["title"]: row["id"] for _, row in books.iterrows()} if not books.empty else {}
 
-# ---------- Members ----------
-elif page == "Members":
-    st.subheader("Add a Member")
+    with st.form("add_copy"):
+        sel = st.selectbox("Book", options=list(book_map.keys()) if book_map else ["(no books)"])
+        acc = st.text_input("Accession No (unique code)")
+        loc = st.text_input("Current Location (e.g., Compartment 5)")
+        s = st.form_submit_button("Add Copy")
+        if s and book_map and acc.strip():
+            run_write("INSERT INTO copies(book_id, accession_no, current_location, status) VALUES(?,?,?,?)",
+                      (book_map[sel], acc.strip(), loc.strip(), "available"))
+            st.success("Copy added.")
+            st.rerun()
+
+def page_members():
+    st.subheader("Members")
+    df = fetch_df("SELECT id, name, email FROM members ORDER BY name")
+    st.dataframe(df, use_container_width=True)
+
+    st.write("---")
+    st.subheader("Add Member")
     with st.form("add_member"):
-        name = st.text_input("Name*")
-        phone = st.text_input("Phone")
-        email = st.text_input("Email")
-        notes = st.text_area("Notes")
-        s = st.form_submit_button("Add Member")
-        if s and name.strip():
-            run_write("INSERT INTO members(name, phone, email, notes) VALUES(?,?,?,?)",
-                      (name.strip(), phone, email, notes))
+        n = st.text_input("Name")
+        e = st.text_input("Email")
+        s = st.form_submit_button("Add")
+        if s and n.strip():
+            run_write("INSERT INTO members(name, email) VALUES(?,?)", (n.strip(), e.strip()))
             st.success("Member added.")
+            st.rerun()
 
-    st.subheader("All Members")
-    ms = fetch_df("SELECT id, name, phone, email FROM members ORDER BY name")
-    st.dataframe(ms)
+def page_issue_return():
+    st.subheader("Issue / Return")
 
-# ---------- Issue / Return ----------
-elif page == "Issue / Return":
-    st.subheader("Issue a Book")
-    # copies available
-    avail = fetch_df("""
-        SELECT c.id, c.accession_no, b.title FROM copies c
-        JOIN books b ON b.id = c.book_id
-        WHERE c.id NOT IN (SELECT copy_id FROM transactions WHERE return_date IS NULL OR return_date='')
+    # Issue
+    st.markdown("### Issue a Copy")
+    copies = fetch_df("""
+        SELECT c.id, b.title || ' — ' || IFNULL(c.accession_no,'') AS label
+        FROM copies c JOIN books b ON b.id = c.book_id
+        WHERE c.status='available'
         ORDER BY b.title
     """)
-    mems = fetch_df("SELECT id, name FROM members ORDER BY name")
+    members = fetch_df("SELECT id, name FROM members ORDER BY name")
+    if copies.empty or members.empty:
+        st.info("Need at least one available copy and one member.")
+    else:
+        copy_map = {row["label"]: row["id"] for _, row in copies.iterrows()}
+        mem_map = {row["name"]: row["id"] for _, row in members.iterrows()}
+        with st.form("issue_form"):
+            csel = st.selectbox("Copy", list(copy_map.keys()))
+            msel = st.selectbox("Member", list(mem_map.keys()))
+            due = st.date_input("Due date", value=date.today())
+            s = st.form_submit_button("Issue")
+            if s:
+                cid = copy_map[csel]
+                mid = mem_map[msel]
+                now = datetime.now().date().isoformat()
+                run_write("INSERT INTO transactions(copy_id, member_id, issue_date, due_date) VALUES(?,?,?,?)",
+                          (cid, mid, now, due.isoformat()))
+                run_write("UPDATE copies SET status='issued' WHERE id=?", (cid,))
+                st.success("Copy issued.")
+                st.rerun()
 
-    with st.form("issue_form"):
-        copy_choice = st.selectbox("Copy (only available listed)", options=avail['accession_no'].tolist() if len(avail)>0 else [])
-        member_choice = st.selectbox("Member", options=mems['name'].tolist() if len(mems)>0 else [])
-        issue_date = st.date_input("Issue Date", value=date.today())
-        due_date = st.date_input("Due Date", value=date.today()+timedelta(days=14))
-        s = st.form_submit_button("Issue")
-        if s:
-            if len(avail)==0 or len(mems)==0:
-                st.error("Need at least one available copy and one member.")
-            else:
-                copy_id = int(avail.loc[avail['accession_no']==copy_choice, 'id'].iloc[0])
-                member_id = int(mems.loc[mems['name']==member_choice, 'id'].iloc[0])
-                run_write("""INSERT INTO transactions(copy_id, member_id, issue_date, due_date) VALUES(?,?,?,?)""",
-                          (copy_id, member_id, str(issue_date), str(due_date)))
-                st.success("Issued.")
-
-    st.subheader("Return a Book")
+    # Return
+    st.markdown("### Return a Copy")
     open_tx = fetch_df("""
-        SELECT t.id, c.accession_no, b.title, m.name AS member, t.issue_date, t.due_date
+        SELECT t.id, b.title || ' — ' || IFNULL(c.accession_no,'') AS label
         FROM transactions t
         JOIN copies c ON c.id = t.copy_id
         JOIN books b ON b.id = c.book_id
-        JOIN members m ON m.id = t.member_id
-        WHERE t.return_date IS NULL OR t.return_date=''
+        WHERE t.return_date IS NULL
         ORDER BY t.id DESC
     """)
-    if len(open_tx)>0:
-        idx = st.selectbox("Open issues", options=open_tx['id'].tolist(),
-                           format_func=lambda i: f"{int(i)} – {open_tx.loc[open_tx['id']==i, 'accession_no'].iloc[0]} – {open_tx.loc[open_tx['id']==i, 'title'].iloc[0]} ({open_tx.loc[open_tx['id']==i, 'member'].iloc[0]})")
-        if st.button("Mark Returned Today"):
-            run_write("UPDATE transactions SET return_date = DATE('now') WHERE id=?", (int(idx),))
-            st.success("Returned.")
+    if open_tx.empty:
+        st.info("No open issues.")
+    else:
+        tx_map = {row["label"]: row["id"] for _, row in open_tx.iterrows()}
+        with st.form("return_form"):
+            tsel = st.selectbox("Issued Copy", list(tx_map.keys()))
+            s = st.form_submit_button("Return")
+            if s:
+                tid = tx_map[tsel]
+                today = datetime.now().date().isoformat()
+                # mark return
+                run_write("UPDATE transactions SET return_date=? WHERE id=?", (today, tid))
+                # set copy available
+                # find copy id
+                cdf = fetch_df("SELECT copy_id FROM transactions WHERE id=?", (tid,))
+                if not cdf.empty:
+                    run_write("UPDATE copies SET status='available' WHERE id=?", (int(cdf.loc[0,"copy_id"]),))
+                st.success("Returned.")
+                st.rerun()
 
-    st.subheader("All Transactions (latest 200)")
-    tx = fetch_df("""
-        SELECT t.id, c.accession_no, b.title, m.name AS member, t.issue_date, t.due_date, t.return_date
-        FROM transactions t
-        JOIN copies c ON c.id = t.copy_id
-        JOIN books b ON b.id = c.book_id
-        JOIN members m ON m.id = t.member_id
-        ORDER BY t.id DESC LIMIT 200
-    """)
-    st.dataframe(tx)
+def page_locations():
+    st.subheader("Locations")
+    ensure_default_locations(45)
 
-# ---------- Locations ----------
-elif page == "Locations":
-    st.subheader("Add / Edit Locations")
     locs = fetch_df("SELECT id, location_id, description FROM locations ORDER BY id")
     st.dataframe(locs, use_container_width=True)
+
+    st.write("---")
+    st.subheader("Browse a Location")
+    all_locs = locs['location_id'].tolist()
+    sel = st.selectbox("Choose a location", options=all_locs)
+    if sel:
+        st.markdown(f"### 📍 {sel}")
+
+        titles_here = fetch_df("""
+            SELECT b.id AS Book_ID, b.title AS Title, b.author AS Author, b.genre AS Genre
+            FROM books b
+            WHERE LOWER(IFNULL(b.default_location,'')) = LOWER(?)
+            ORDER BY b.title
+        """, (sel,))
+        st.markdown("**Titles assigned here (Books.default_location):**")
+        st.dataframe(titles_here, use_container_width=True)
+
+        copies_here = fetch_df("""
+            SELECT c.id AS Copy_ID, c.accession_no, b.title AS Title, b.author AS Author, c.status AS Status
+            FROM copies c
+            JOIN books b ON b.id = c.book_id
+            WHERE LOWER(IFNULL(c.current_location,'')) = LOWER(?)
+            ORDER BY b.title
+        """, (sel,))
+        st.markdown("**Copies currently here (Copies.current_location):**")
+        st.dataframe(copies_here, use_container_width=True)
+
+    st.write("---")
+    st.subheader("Add a Location")
     with st.form("add_loc"):
         lid = st.text_input("Location ID (e.g., Compartment 12)")
         desc = st.text_input("Description")
         s = st.form_submit_button("Add Location")
         if s and lid.strip():
-            run_write("INSERT OR IGNORE INTO locations(location_id, description) VALUES(?,?)", (lid.strip(), desc))
+            run_write("INSERT OR IGNORE INTO locations(location_id, description) VALUES(?,?)",
+                      (lid.strip(), desc.strip()))
             st.success("Location added.")
+            st.rerun()
 
-# ---------- Import / Export ----------
-elif page == "Import / Export":# ---- Merge import (no duplicates; updates existing titles) ----
-import sqlite3
+def page_import_export():
+    st.subheader("Import / Export")
 
-def ensure_unique_title_index():
-    conn = sqlite3.connect("library.db")
-    with conn:
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_books_title ON books(title COLLATE NOCASE);")
-    conn.close()
+    # ---- Merge import (no duplicates; updates existing titles) ----
+    st.markdown("### Merge import (no duplicates)")
+    merge_up = st.file_uploader(
+        "Upload Books CSV (Title, Author, Genre, Default_Location)",
+        type=["csv"],
+        key="merge_books",
+    )
+    if merge_up is not None:
+        df = pd.read_csv(merge_up)
+        st.write("Uploaded rows:", len(df))
+        st.write("Columns:", list(df.columns))
 
-def upsert_book_row(conn, title, author, genre, defloc):
-    conn.execute("""
-        INSERT INTO books(title, author, genre, default_location)
-        VALUES(?,?,?,?)
-        ON CONFLICT(title) DO UPDATE SET
-          author=excluded.author,
-          genre=excluded.genre,
-          default_location=excluded.default_location;
-    """, (title, author or "", genre or "", defloc or ""))
+        # Ensure index for upsert
+        conn = get_conn()
+        with conn:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_books_title ON books(title COLLATE NOCASE);")
 
-st.subheader("Merge import (no duplicates)")
-merge_up = st.file_uploader("Upload Books CSV (Title, Author, Genre, Default_Location)", type=["csv"], key="merge_books")
-if merge_up is not None:
-    import pandas as pd
-    df = pd.read_csv(merge_up)
-    st.write("Uploaded rows:", len(df))
-    st.write("Columns:", list(df.columns))
-    ensure_unique_title_index()
-    conn = sqlite3.connect("library.db")
-    changed = 0
-    with conn:
-        for _, r in df.iterrows():
-            t = str(r.get("Title","")).strip()
-            if not t:
-                continue
-            upsert_book_row(conn, t, r.get("Author",""), r.get("Genre",""), r.get("Default_Location",""))
-            changed += 1
-    conn.close()
-    st.success(f"Merged {changed} rows. Existing titles updated; new titles added.")
-    st.rerun()
-    st.subheader("Import Books (CSV)")
-    up = st.file_uploader("Upload CSV with columns: Title, Author, Genre, Default_Location (optional)", type=["csv"])
-    if up is not None:
-        imp = pd.read_csv(up)
-        ok = 0
-        for _, r in imp.iterrows():
-            title = str(r.get("Title","")).strip()
-            if not title: 
-                continue
-            author = str(r.get("Author",""))
-            genre = str(r.get("Genre",""))
-            defloc = str(r.get("Default_Location",""))
-            run_write("""
-                INSERT OR IGNORE INTO books(title, author, genre, default_location)
-                VALUES(?,?,?,?)
-            """, (title, author, genre, defloc))
-            ok += 1
-        st.success(f"Imported {ok} titles.")
+            # upsert each row
+            for _, r in df.iterrows():
+                title = str(r.get("Title", "")).strip()
+                if not title:
+                    continue
+                author = str(r.get("Author", "")).strip()
+                genre = str(r.get("Genre", "")).strip()
+                defloc = str(r.get("Default_Location", "")).strip()
+                conn.execute("""
+                    INSERT INTO books(title, author, genre, default_location)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(title) DO UPDATE SET
+                      author=excluded.author,
+                      genre=excluded.genre,
+                      default_location=excluded.default_location;
+                """, (title, author, genre, defloc))
+        conn.close()
+        st.success("Merge import complete. Existing titles updated; new titles added.")
+        st.rerun()
 
-    st.subheader("Export CSVs")
-    if st.button("Export Books"):
-        df = fetch_df("SELECT * FROM books ORDER BY title")
-        st.download_button("Download Books.csv", data=df.to_csv(index=False), file_name="Books.csv", mime="text/csv")
-    if st.button("Export Copies"):
-        df = fetch_df("SELECT * FROM copies ORDER BY id")
-        st.download_button("Download Copies.csv", data=df.to_csv(index=False), file_name="Copies.csv", mime="text/csv")
-    if st.button("Export Members"):
-        df = fetch_df("SELECT * FROM members ORDER BY name")
-        st.download_button("Download Members.csv", data=df.to_csv(index=False), file_name="Members.csv", mime="text/csv")
-    if st.button("Export Transactions"):
-        df = fetch_df("SELECT * FROM transactions ORDER BY id DESC")
-        st.download_button("Download Transactions.csv", data=df.to_csv(index=False), file_name="Transactions.csv", mime="text/csv")
-    if st.button("Export Locations"):
-        df = fetch_df("SELECT * FROM locations ORDER BY id")
-        st.download_button("Download Locations.csv", data=df.to_csv(index=False), file_name="Locations.csv", mime="text/csv")
+    # Export books
+    st.markdown("### Export books (CSV)")
+    if st.button("Download books.csv"):
+        df = fetch_df("SELECT title AS Title, author AS Author, genre AS Genre, default_location AS Default_Location FROM books ORDER BY title")
+        st.download_button("Save books.csv", data=df.to_csv(index=False), file_name="books.csv", mime="text/csv")
+
+# ------------- Main -------------
+def main():
+    st.set_page_config(page_title="KEN Library System", page_icon="📚", layout="wide")
+    init_db()
+    ensure_default_locations(45)
+
+    page = sidebar()
+    if page == "Dashboard":
+        page_dashboard()
+    elif page == "Search":
+        page_search()
+    elif page == "Books":
+        page_books()
+    elif page == "Copies":
+        page_copies()
+    elif page == "Members":
+        page_members()
+    elif page == "Issue / Return":
+        page_issue_return()
+    elif page == "Locations":
+        page_locations()
+    elif page == "Import / Export":
+        page_import_export()
+
+if __name__ == "__main__":
+    main()
+# --- app.py ends here ---
+
+
+   
+
+       
