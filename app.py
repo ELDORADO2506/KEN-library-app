@@ -312,57 +312,85 @@ def page_copies():
     """)
     st.dataframe(df, use_container_width=True)
 
+def run_sql(sql, params=()):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        conn.commit()
+        return cur.lastrowid
 
 def page_issue_return():
-    st.title("🔄 Issue / Return")
+    st.title("Issue / Return")
 
-    st.subheader("Issue a Copy")
-    # available copies
-    avail = fetch_df("""
-        SELECT c.id, (b.title || CASE WHEN IFNULL(c.accession_no,'')<>'' THEN ' — '|| c.accession_no ELSE '' END) AS label
-        FROM copies c JOIN books b ON b.id=c.book_id
-        WHERE c.status='available'
-        ORDER BY b.title
+    # --- Issue a book (no copies) ---
+    st.subheader("Issue a Book")
+    books = fetch_df("SELECT id, title FROM books ORDER BY title")
+    if books.empty:
+        st.info("No books yet. Please add books on the Books page.")
+        return
+    book_label_to_id = dict(zip(books["title"], books["id"]))
+    book_label = st.selectbox("Book title", books["title"])
+
+    members = fetch_df("SELECT id, name FROM members ORDER BY name")
+    if members.empty:
+        st.info("No members yet. Please add members on the Members page.")
+        return
+    member_label_to_id = dict(zip(members["name"], members["id"]))
+    member_label = st.selectbox("Member", members["name"])
+
+    due_date = st.date_input("Due date (optional)", value=None)
+
+    if st.button("Issue"):
+        book_id = book_label_to_id[book_label]
+        member_id = member_label_to_id[member_label]
+        run_sql(
+            "INSERT INTO transactions(book_id, member_id, issue_date, due_date) VALUES (?, ?, DATE('now'), ?)",
+            (book_id, member_id, str(due_date) if due_date else None)
+        )
+        st.success(f"Issued **{book_label}** to **{member_label}**")
+
+    st.divider()
+
+    # --- Open issues table ---
+    st.subheader("Open Issues (right now)")
+    open_df = fetch_df("""
+        SELECT t.id AS Txn_ID,
+               b.title AS Title,
+               m.name AS Member,
+               t.issue_date AS Issued_On,
+               t.due_date   AS Due_On
+        FROM transactions t
+        JOIN books b   ON b.id = t.book_id
+        JOIN members m ON m.id = t.member_id
+        WHERE t.return_date IS NULL
+        ORDER BY t.issue_date DESC
     """)
-    if avail.empty:
-        st.info("No available copies.")
-    else:
-        pick = st.selectbox("Choose copy to issue", avail["label"].tolist())
-        copy_id = int(avail.iloc[avail["label"].tolist().index(pick)]["id"])
-        issued_to = st.text_input("Issued to (name)")
-        days = st.number_input("Days until due", 1, 60, 14)
-        if st.button("Issue"):
-            today = datetime.now().date()
-            due = today + timedelta(days=int(days))
-            exec_sql("""
-                UPDATE copies
-                SET status='issued', issued_to=?, issue_date=?, due_date=?
-                WHERE id=?
-            """, (issued_to.strip(), str(today), str(due), copy_id))
-            st.success("Issued.")
-            st.rerun()
+    st.dataframe(open_df, use_container_width=True)
 
-    st.subheader("Return a Copy")
-    out = fetch_df("""
-        SELECT c.id, (b.title || CASE WHEN IFNULL(c.accession_no,'')<>'' THEN ' — '|| c.accession_no ELSE '' END) AS label
-        FROM copies c JOIN books b ON b.id=c.book_id
-        WHERE c.status='issued'
-        ORDER BY b.title
+    # Return one row
+    if not open_df.empty:
+        ret_id = st.selectbox("Pick a transaction to return", open_df["Txn_ID"].tolist())
+        if st.button("Mark returned"):
+            run_sql("UPDATE transactions SET return_date = DATE('now') WHERE id = ?", (int(ret_id),))
+            st.success("Marked as returned ✅")
+
+    st.divider()
+
+    # --- History (optional) ---
+    st.subheader("Issue History (recent)")
+    hist_df = fetch_df("""
+        SELECT b.title AS Title,
+               m.name  AS Member,
+               t.issue_date AS Issued_On,
+               t.due_date   AS Due_On,
+               t.return_date AS Returned_On
+        FROM transactions t
+        JOIN books b   ON b.id = t.book_id
+        JOIN members m ON m.id = t.member_id
+        ORDER BY t.id DESC
+        LIMIT 200
     """)
-    if out.empty:
-        st.info("No open issues.")
-    else:
-        pick2 = st.selectbox("Choose copy to return", out["label"].tolist())
-        copy_id2 = int(out.iloc[out["label"].tolist().index(pick2)]["id"])
-        if st.button("Return"):
-            exec_sql("""
-                UPDATE copies
-                SET status='available', issued_to=NULL, issue_date=NULL, due_date=NULL
-                WHERE id=?
-            """, (copy_id2,))
-            st.success("Returned.")
-            st.rerun()
-
+    st.dataframe(hist_df, use_container_width=True)
 
 def page_locations():
     st.title("📍 Locations")
@@ -461,6 +489,14 @@ def main():
     }
     pages[page]()
 
+PAGES = {
+    "Dashboard": page_dashboard,
+    "Issue / Return": page_issue_return,
+    # (keep your other pages too, e.g. "Books": page_books, "Members": page_members, "Locations": page_locations)
+}
+
+choice = st.sidebar.radio("Go to", list(PAGES.keys()))
+PAGES[choice]()
 
 if __name__ == "__main__":
     main()
