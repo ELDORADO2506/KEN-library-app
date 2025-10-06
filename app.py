@@ -38,7 +38,10 @@ def ensure_migration():
         c.commit()
 
 # call it once when app starts
+init_db()
 ensure_migration()
+ensure_default_locations(45)   # creates/keeps “Compartment 1…45”
+
 # ===== end migration helper =====
 
 import pandas as pd
@@ -125,6 +128,19 @@ def init_db():
                 description TEXT
             )
         """)
+    # Transactions (book issues / returns)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id   INTEGER,           -- required (we are issuing by book, not copy)
+            member_id INTEGER,           -- who borrowed
+            copy_id   INTEGER,           -- optional (kept only for older data)
+            issue_date  TEXT DEFAULT DATE('now'),
+            due_date    TEXT,
+            return_date TEXT,
+            FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+        )
+    """)
 
         con.commit()
 
@@ -185,18 +201,11 @@ def selectbox_location(label="Location", allow_empty=False):
     options = df["name"].tolist()
     if allow_empty:
         options = [""] + options
-    return st.selectbox(label, options)
-
-
-# --------------------------- Pages --------------------------- #
-import pandas as pd
+    
 import streamlit as st
 import sqlite3
 
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def fetch_df(sql, params=()):
     with get_conn() as conn:
         return pd.read_sql_query(sql, conn, params=params)
 
@@ -478,23 +487,11 @@ def main():
             "Dashboard", "Search", "Books", "Copies", "Issue / Return", "Locations", "Import / Export"
         ], index=0)
 
-    pages = {
-        "Dashboard": page_dashboard,
-        "Search": page_search,
-        "Books": page_books,
-        "Copies": page_copies,
-        "Issue / Return": page_issue_return,
-        "Locations": page_locations,
-        "Import / Export": page_import_export,
-    }
-    pages[page]()
-
-PAGES = {
+   PAGES = {
     "Dashboard": page_dashboard,
     "Issue / Return": page_issue_return,
-    # (keep your other pages too, e.g. "Books": page_books, "Members": page_members, "Locations": page_locations)
+    # (you can keep others here too: "Books": page_books, "Members": page_members, "Locations": page_locations)
 }
-
 choice = st.sidebar.radio("Go to", list(PAGES.keys()))
 PAGES[choice]()
 
