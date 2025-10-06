@@ -101,7 +101,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 book_id INTEGER,
                 accession_no TEXT,
-                status TEXT DEFAULT 'available',                -- 'available' | 'issued'
+                status TEXT DEFAULT 'available',   -- 'available' | 'issued'
                 current_location TEXT,
                 issued_to TEXT,
                 issue_date TEXT,
@@ -110,7 +110,7 @@ def init_db():
             )
         """)
 
-        # Members (very simple for now)
+        # Members
         cur.execute("""
             CREATE TABLE IF NOT EXISTS members(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +120,7 @@ def init_db():
             )
         """)
 
-        # Locations (will be healed by migrate_locations)
+        # Locations
         cur.execute("""
             CREATE TABLE IF NOT EXISTS locations(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,22 +128,22 @@ def init_db():
                 description TEXT
             )
         """)
-    # Transactions (book issues / returns)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            book_id   INTEGER,           -- required (we are issuing by book, not copy)
-            member_id INTEGER,           -- who borrowed
-            copy_id   INTEGER,           -- optional (kept only for older data)
-            issue_date  TEXT DEFAULT DATE('now'),
-            due_date    TEXT,
-            return_date TEXT,
-            FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
-        )
-    """)
+
+        # Transactions (issue / return by BOOK)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS transactions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id   INTEGER,
+                member_id INTEGER,
+                copy_id   INTEGER,                    -- optional
+                issue_date  TEXT DEFAULT DATE('now'),
+                due_date    TEXT,
+                return_date TEXT,
+                FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+            )
+        """)
 
         con.commit()
-
 
 def migrate_locations():
     """Ensure 'locations' table exists and has the expected columns."""
