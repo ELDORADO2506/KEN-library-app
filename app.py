@@ -481,13 +481,20 @@ def main():
             "Dashboard", "Search", "Books", "Copies", "Issue / Return", "Locations", "Import / Export"
         ], index=0)
 
-   PAGES = {
+    # ---- navigation ----
+    PAGES = {
     "Dashboard": page_dashboard,
     "Issue / Return": page_issue_return,
-    # (you can keep others here too: "Books": page_books, "Members": page_members, "Locations": page_locations)
-}
-choice = st.sidebar.radio("Go to", list(PAGES.keys()))
-PAGES[choice]()
+    # You can keep others too if you want:
+    # "Books": page_books,
+    # "Members": page_members,
+    # "Locations": page_locations,
+    # "Import / Export": page_import_export,
+    }
+
+    choice = st.sidebar.radio("Go to", list(PAGES.keys()))
+    PAGES[choice]()
+
 
 if __name__ == "__main__":
     main()
