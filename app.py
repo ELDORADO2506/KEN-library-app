@@ -206,9 +206,15 @@ import streamlit as st
 import sqlite3
 
 
-    with get_conn() as conn:
         return pd.read_sql_query(sql, conn, params=params)
 
+# ---- DB helpers (keep exactly one copy in the file) ----
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def fetch_df(sql, params=()):
+    with get_conn() as conn:
+        return pd.read_sql_query(sql, conn, params=params)
 def page_dashboard():
     st.title("KEN Library System")
 
