@@ -153,21 +153,72 @@ def selectbox_location(label="Location", allow_empty=False):
 
 
 # --------------------------- Pages --------------------------- #
+import pandas as pd
+import streamlit as st
+import sqlite3
+
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def fetch_df(sql, params=()):
+    with get_conn() as conn:
+        return pd.read_sql_query(sql, conn, params=params)
+
 def page_dashboard():
-    total_titles = fetch_df("SELECT COUNT(*) AS c FROM books")["c"].iat[0]
-    total_copies = fetch_df("SELECT COUNT(*) AS c FROM copies")["c"].iat[0]
-    open_issues = fetch_df("SELECT COUNT(*) AS c FROM copies WHERE status='issued'")["c"].iat[0]
+    st.title("KEN Library System")
 
-    st.title("📚 KEN Library System")
+    # KPIs
+    total_books = fetch_df("SELECT COUNT(*) AS c FROM books")["c"][0]
+    issued_now  = fetch_df("SELECT COUNT(*) AS c FROM transactions WHERE return_date IS NULL")["c"][0]
+    total_issues = fetch_df("SELECT COUNT(*) AS c FROM transactions")["c"][0]
+
     c1, c2, c3 = st.columns(3)
-    with c1: titled_number("Total Titles", total_titles)
-    with c2: titled_number("Total Copies", total_copies)
-    with c3: titled_number("Issued Now (open)", open_issues)
+    c1.metric("Total Books", total_books)
+    c2.metric("Issued Now (open)", issued_now)
+    c3.metric("Total Issues Ever", total_issues)
 
-    g = fetch_df("SELECT IFNULL(genre,'(Uncategorized)') AS genre, COUNT(*) AS c FROM books GROUP BY genre ORDER BY c DESC")
-    if not g.empty:
-        st.subheader("Titles by Genre")
-        st.bar_chart(g.set_index("genre"))
+    st.subheader("Genres (table)")
+    genre_tbl = fetch_df("""
+        SELECT
+          COALESCE(genre,'(Uncategorized)') AS Genre,
+          COUNT(*) AS Titles,
+          SUM(
+            EXISTS(
+              SELECT 1 FROM transactions t
+              WHERE t.book_id = b.id AND t.return_date IS NULL
+            )
+          ) AS Titles_Issued_Now
+        FROM books b
+        GROUP BY genre
+        ORDER BY Titles DESC, Genre
+    """)
+    st.dataframe(genre_tbl, use_container_width=True)
+
+    st.markdown("### Pick a genre to see its books")
+    genres = ["(All)"] + sorted(genre_tbl["Genre"].unique().tolist())
+    pick = st.selectbox("Genre", genres, index=0)
+
+    if pick == "(All)":
+        books_in_genre = fetch_df("""
+          SELECT b.id, b.title AS Title, b.author AS Author,
+                 COALESCE(b.genre,'(Uncategorized)') AS Genre,
+                 (SELECT COUNT(*) FROM transactions t
+                  WHERE t.book_id=b.id AND t.return_date IS NULL) AS Issued_Now
+          FROM books b
+          ORDER BY b.title
+        """)
+    else:
+        books_in_genre = fetch_df("""
+          SELECT b.id, b.title AS Title, b.author AS Author,
+                 COALESCE(b.genre,'(Uncategorized)') AS Genre,
+                 (SELECT COUNT(*) FROM transactions t
+                  WHERE t.book_id=b.id AND t.return_date IS NULL) AS Issued_Now
+          FROM books b
+          WHERE COALESCE(b.genre,'(Uncategorized)') = ?
+          ORDER BY b.title
+        """, (pick,))
+
+    st.dataframe(books_in_genre, use_container_width=True)
 
 
 def page_search():
