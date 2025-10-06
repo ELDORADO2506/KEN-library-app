@@ -38,9 +38,8 @@ def ensure_migration():
         c.commit()
 
 # call it once when app starts
-init_db()
-ensure_migration()
-ensure_default_locations(45)   # creates/keeps “Compartment 1…45”
+
+# creates/keeps “Compartment 1…45”
 
 # ===== end migration helper =====
 
@@ -472,6 +471,7 @@ def main():
 
     # Ensure DB & 45 compartments exist (and columns are correct)
     init_db()
+    ensure_migration()
     migrate_locations()
     ensure_default_locations(45)
 
