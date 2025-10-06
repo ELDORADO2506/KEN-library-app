@@ -1,67 +1,96 @@
 # KEN Library App (Streamlit + SQLite)
 # Minimal, safe, and self-healing version with location migration + 45 compartments
+
 import os
 import io
-import sqlite3
 from datetime import datetime, timedelta
-
-# ===== one-time migration helper (safe to run many times) =====
 import sqlite3
+import pandas as pd
+import streamlit as st
 
-# If DB_PATH already exists in your file, delete this next line OR keep only one of them
+# ======================================================================
+#                             CONFIG
+# ======================================================================
+
 DB_PATH = "library.db"   # change only if your DB file is named differently
 
-def _column_exists(db, table, col):
-    with sqlite3.connect(db) as c:
-        cur = c.cursor()
+
+# ======================================================================
+#                        ONE-TIME MIGRATION HELPERS
+# (safe to run multiple times; they only change what's missing)
+# ======================================================================
+
+def _column_exists(db_path: str, table: str, col: str) -> bool:
+    """Return True if a column exists on a table."""
+    with sqlite3.connect(db_path) as con:
+        cur = con.cursor()
         cur.execute(f"PRAGMA table_info({table})")
         cols = [r[1] for r in cur.fetchall()]
         return col in cols
 
+
 def ensure_migration():
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.cursor()
-        # 1) add book_id to transactions if missing
-        if not _column_exists(DB_PATH, "transactions", "book_id"):
-            cur.execute("ALTER TABLE transactions ADD COLUMN book_id INTEGER")
-            # fill book_id from copies (if copies exist)
+    """
+    Bring older databases forward:
+    - Ensure transactions has book_id (older code sometimes wrote copy_id)
+    - Create helpful index for open-issues-by-book
+    """
+    # If the tables don't exist yet, this does nothing harmful; init_db() will
+    # run just before in main() and on "Repair".
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+
+        # 1) Add book_id to transactions if missing (older schema might not have it)
+        if _table_exists(cur, "transactions") and not _column_exists(DB_PATH, "transactions", "book_id"):
+            try:
+                cur.execute("ALTER TABLE transactions ADD COLUMN book_id INTEGER")
+                # Backfill from copies.copy_id if present
+                if _column_exists(DB_PATH, "transactions", "copy_id") and _table_exists(cur, "copies"):
+                    cur.execute("""
+                        UPDATE transactions
+                           SET book_id = (
+                               SELECT book_id FROM copies c WHERE c.id = transactions.copy_id
+                           )
+                         WHERE book_id IS NULL AND copy_id IS NOT NULL
+                    """)
+            except sqlite3.OperationalError:
+                # If something odd happens (e.g. table missing), just continue;
+                # init_db will create the correct table.
+                pass
+
+        # 2) Helpful index for "open" issues by book
+        try:
             cur.execute("""
-                UPDATE transactions
-                SET book_id = (SELECT book_id FROM copies c WHERE c.id = transactions.copy_id)
-                WHERE book_id IS NULL AND copy_id IS NOT NULL
+                CREATE INDEX IF NOT EXISTS ix_trans_book_open
+                  ON transactions(book_id) WHERE return_date IS NULL
             """)
-        # 2) helpful index
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS ix_trans_book_open
-            ON transactions(book_id) WHERE return_date IS NULL
-        """)
-        c.commit()
+        except sqlite3.OperationalError:
+            pass
 
-# call it once when app starts
-
-# creates/keeps “Compartment 1…45”
-
-# ===== end migration helper =====
-
-import pandas as pd
-import streamlit as st
-
-DB_PATH
+        con.commit()
 
 
-# --------------------------- DB Helpers --------------------------- #
+def _table_exists(cur: sqlite3.Cursor, name: str) -> bool:
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (name,))
+    return cur.fetchone() is not None
+
+
+# ======================================================================
+#                            DB HELPERS
+# ======================================================================
+
 def get_conn():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.execute("PRAGMA foreign_keys = ON")
     return con
 
 
-def fetch_df(sql, params=()):
+def fetch_df(sql: str, params: tuple = ()):
     with get_conn() as con:
         return pd.read_sql_query(sql, con, params=params)
 
 
-def exec_sql(sql, params=()):
+def exec_sql(sql: str, params: tuple = ()):
     with get_conn() as con:
         cur = con.cursor()
         cur.execute(sql, params)
@@ -69,15 +98,19 @@ def exec_sql(sql, params=()):
         return cur.lastrowid
 
 
-def exec_many(sql, rows):
+def exec_many(sql: str, rows):
     with get_conn() as con:
         cur = con.cursor()
         cur.executemany(sql, rows)
         con.commit()
 
 
-# --------------------------- Schema & Migrations --------------------------- #
+# ======================================================================
+#                      SCHEMA + GUARDED (RE)CREATION
+# ======================================================================
+
 def init_db():
+    """Create tables if they don't exist (safe to run many times)."""
     with get_conn() as con:
         cur = con.cursor()
 
@@ -94,7 +127,7 @@ def init_db():
             )
         """)
 
-        # Copies
+        # Copies (kept for import/export/history, but Issue/Return works without copies)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS copies(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +142,7 @@ def init_db():
             )
         """)
 
-        # Members
+        # Members (simple)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS members(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +152,7 @@ def init_db():
             )
         """)
 
-        # Locations
+        # Locations (will be healed by migrate_locations)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS locations(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,21 +161,23 @@ def init_db():
             )
         """)
 
-        # Transactions (issue / return by BOOK)
+        # Transactions (ISSUE/RETURN BY BOOK)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS transactions(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                book_id   INTEGER,
-                member_id INTEGER,
-                copy_id   INTEGER,                    -- optional
+                book_id     INTEGER,
+                member_id   INTEGER,
+                copy_id     INTEGER,                    -- optional (not needed for your flow)
                 issue_date  TEXT DEFAULT DATE('now'),
                 due_date    TEXT,
                 return_date TEXT,
-                FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+                FOREIGN KEY(book_id)   REFERENCES books(id)    ON DELETE CASCADE,
+                FOREIGN KEY(member_id) REFERENCES members(id)  ON DELETE CASCADE
             )
         """)
 
         con.commit()
+
 
 def migrate_locations():
     """Ensure 'locations' table exists and has the expected columns."""
@@ -155,15 +190,15 @@ def migrate_locations():
                 description TEXT
             )
         """)
-        # verify columns
+        # verify/add column
         cols = [r[1] for r in cur.execute("PRAGMA table_info(locations)").fetchall()]
         if "description" not in cols:
             cur.execute("ALTER TABLE locations ADD COLUMN description TEXT")
         con.commit()
 
 
-def ensure_default_locations(n=45):
-    """Insert Compartment 1..n if they don't exist."""
+def ensure_default_locations(n: int = 45):
+    """Insert 'Compartment 1..n' once."""
     migrate_locations()
     with get_conn() as con:
         cur = con.cursor()
@@ -175,7 +210,10 @@ def ensure_default_locations(n=45):
         con.commit()
 
 
-# --------------------------- UI Helpers --------------------------- #
+# ======================================================================
+#                              UI HELPERS
+# ======================================================================
+
 def titled_number(label, value):
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -197,17 +235,22 @@ def selectbox_book(label="Book"):
 
 def selectbox_location(label="Location", allow_empty=False):
     df = fetch_df("SELECT name FROM locations ORDER BY id")
-    options = df["name"].tolist()
+    opts = df["name"].tolist()
     if allow_empty:
-        options = [""] + options
+        opts = [""] + opts
+    return st.selectbox(label, opts) if opts else ""
 
+
+# ======================================================================
+#                                PAGES
+# ======================================================================
 
 def page_dashboard():
     st.title("KEN Library System")
 
     # KPIs
-    total_books = fetch_df("SELECT COUNT(*) AS c FROM books")["c"][0]
-    issued_now  = fetch_df("SELECT COUNT(*) AS c FROM transactions WHERE return_date IS NULL")["c"][0]
+    total_books  = fetch_df("SELECT COUNT(*) AS c FROM books")["c"][0]
+    issued_now   = fetch_df("SELECT COUNT(*) AS c FROM transactions WHERE return_date IS NULL")["c"][0]
     total_issues = fetch_df("SELECT COUNT(*) AS c FROM transactions")["c"][0]
 
     c1, c2, c3 = st.columns(3)
@@ -314,12 +357,14 @@ def page_copies():
     """)
     st.dataframe(df, use_container_width=True)
 
+
 def run_sql(sql, params=()):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(sql, params)
         conn.commit()
         return cur.lastrowid
+
 
 def page_issue_return():
     st.title("Issue / Return")
@@ -394,13 +439,15 @@ def page_issue_return():
     """)
     st.dataframe(hist_df, use_container_width=True)
 
+
 def page_locations():
     st.title("📍 Locations")
     with st.expander("➕ Add a Location"):
         name = st.text_input("Name")
         desc = st.text_input("Description")
         if st.button("Add Location", type="primary") and name.strip():
-            exec_sql("INSERT OR IGNORE INTO locations(name, description) VALUES(?, ?)", (name.strip(), desc.strip()))
+            exec_sql("INSERT OR IGNORE INTO locations(name, description) VALUES(?, ?)",
+                     (name.strip(), desc.strip()))
             st.success("Location added.")
             st.rerun()
 
@@ -414,6 +461,7 @@ def page_import_export():
     st.subheader("Repair / Initialize")
     if st.button("Run repair (recreate tables & 45 compartments)"):
         init_db()
+        ensure_migration()
         migrate_locations()
         ensure_default_locations(45)
         st.success("Repair done.")
@@ -454,45 +502,46 @@ def page_import_export():
     with c1:
         if st.button("Export Books"):
             df = fetch_df("SELECT * FROM books ORDER BY title")
-            st.download_button("Download books.csv", df.to_csv(index=False).encode("utf-8"), "books.csv", "text/csv")
+            st.download_button("Download books.csv", df.to_csv(index=False).encode("utf-8"),
+                               "books.csv", "text/csv")
     with c2:
         if st.button("Export Copies"):
             df = fetch_df("SELECT * FROM copies ORDER BY id")
-            st.download_button("Download copies.csv", df.to_csv(index=False).encode("utf-8"), "copies.csv", "text/csv")
+            st.download_button("Download copies.csv", df.to_csv(index=False).encode("utf-8"),
+                               "copies.csv", "text/csv")
     with c3:
         if st.button("Export Locations"):
             df = fetch_df("SELECT * FROM locations ORDER BY id")
-            st.download_button("Download locations.csv", df.to_csv(index=False).encode("utf-8"), "locations.csv", "text/csv")
+            st.download_button("Download locations.csv", df.to_csv(index=False).encode("utf-8"),
+                               "locations.csv", "text/csv")
 
 
-# --------------------------- Main --------------------------- #
+# ======================================================================
+#                                MAIN
+# ======================================================================
+
 def main():
     st.set_page_config(page_title="KEN Library", page_icon="📚", layout="wide")
 
-    # Ensure DB & 45 compartments exist (and columns are correct)
+    # Make sure DB & schema are good every time the app starts
     init_db()
     ensure_migration()
     migrate_locations()
     ensure_default_locations(45)
 
-    with st.sidebar:
-        st.markdown("## Go to")
-        page = st.radio("", [
-            "Dashboard", "Search", "Books", "Copies", "Issue / Return", "Locations", "Import / Export"
-        ], index=0)
-
-    # ---- navigation ----
     PAGES = {
-    "Dashboard": page_dashboard,
-    "Issue / Return": page_issue_return,
-    # You can keep others too if you want:
-    # "Books": page_books,
-    # "Members": page_members,
-    # "Locations": page_locations,
-    # "Import / Export": page_import_export,
+        "Dashboard":      page_dashboard,
+        "Search":         page_search,
+        "Books":          page_books,
+        "Copies":         page_copies,
+        "Issue / Return": page_issue_return,
+        "Locations":      page_locations,
+        "Import / Export": page_import_export,
     }
 
-    choice = st.sidebar.radio("Go to", list(PAGES.keys()))
+    with st.sidebar:
+        choice = st.radio("Go to", list(PAGES.keys()), index=0)
+
     PAGES[choice]()
 
 
