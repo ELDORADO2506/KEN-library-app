@@ -5,10 +5,46 @@ import io
 import sqlite3
 from datetime import datetime, timedelta
 
+# ===== one-time migration helper (safe to run many times) =====
+import sqlite3
+
+# If DB_PATH already exists in your file, delete this next line OR keep only one of them
+DB_PATH = "library.db"   # change only if your DB file is named differently
+
+def _column_exists(db, table, col):
+    with sqlite3.connect(db) as c:
+        cur = c.cursor()
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]
+        return col in cols
+
+def ensure_migration():
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.cursor()
+        # 1) add book_id to transactions if missing
+        if not _column_exists(DB_PATH, "transactions", "book_id"):
+            cur.execute("ALTER TABLE transactions ADD COLUMN book_id INTEGER")
+            # fill book_id from copies (if copies exist)
+            cur.execute("""
+                UPDATE transactions
+                SET book_id = (SELECT book_id FROM copies c WHERE c.id = transactions.copy_id)
+                WHERE book_id IS NULL AND copy_id IS NOT NULL
+            """)
+        # 2) helpful index
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS ix_trans_book_open
+            ON transactions(book_id) WHERE return_date IS NULL
+        """)
+        c.commit()
+
+# call it once when app starts
+ensure_migration()
+# ===== end migration helper =====
+
 import pandas as pd
 import streamlit as st
 
-DB_PATH = "library.db"
+DB_PATH
 
 
 # --------------------------- DB Helpers --------------------------- #
